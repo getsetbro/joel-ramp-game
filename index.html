@@ -58,18 +58,25 @@ html, body { width:100%; height:100%; background:#0A0502; overflow:hidden; }
 const tbar = document.getElementById('tbar');
 const tbx = tbar ? tbar.getContext('2d') : null;
 
-function drawTimerBar() {
+// Only redraw the timer bar when the displayed second actually changes, instead
+// of every animation frame. Reassigning canvas width/height each frame (the old
+// behavior) forces a full backing-store reallocation + clear, which is wasteful.
+let _tbarLast = -1;
+function drawTimerBar(force) {
   if (!tbar || !tbx) return;
+  if (!force && tL === _tbarLast) return;
+  _tbarLast = tL;
   const W = tbar.offsetWidth || tbar.width || 300;
   const H = 5;
-  tbar.width = Math.round(W);
-  tbar.height = H;
+  if (tbar.width !== Math.round(W) || tbar.height !== H) { tbar.width = Math.round(W); tbar.height = H; }
   const pct = Math.max(0, tL / 45);
+  tbx.clearRect(0, 0, tbar.width, tbar.height);
   tbx.fillStyle = 'rgba(0,0,0,0.5)';
   tbx.fillRect(0, 0, W, H);
   tbx.fillStyle = pct > 0.5 ? '#427030' : pct > 0.25 ? '#C08820' : '#A02818';
   tbx.fillRect(0, 0, W * pct, H);
 }
+
 
 function showEndScreen() {
   const pct = throws > 0 ? Math.round((hits / throws) * 100) : 0;
@@ -89,24 +96,88 @@ const ctx = cv.getContext('2d');
 const qc = document.getElementById('qc');
 const qx = qc.getContext('2d');
 
+// Offscreen canvas for the static background (wall + ramp). These never change
+// frame-to-frame, so we render them once and blit with drawImage each frame.
+// This is the single biggest win on iOS Safari, which is slow at building
+// canvas gradients every frame.
+const bgCanvas = document.createElement('canvas');
+const bgCtx = bgCanvas.getContext('2d');
+// Second offscreen layer for the ramp + side walls, which draw *in front* of the
+// moving targets but are themselves static. Rendered once and blitted each frame.
+const fgCanvas = document.createElement('canvas');
+const fgCtx = fgCanvas.getContext('2d');
+let _bgDirty = true;
+
+// Cached ball radial gradient (the ball is always the same colors/size when flying).
+// Built in a local 0,0-centered space so it can be reused for every ball via translate.
+let _ballGrad = null;
+let _chuteBallGrad = null;
+// Cached curtain gradients (rebuilt only on resize).
+let _curtainGradL = null, _curtainGradR = null;
+
+// Cap the device pixel ratio. Retina iPhones report 2-3; capping the backing
+// store size dramatically reduces per-frame fill cost (the canvas does a lot of
+// large gradient/overdraw fills) while keeping the image crisp enough.
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+
 function resize() {
   const hud = document.getElementById('hud');
   const bb  = document.getElementById('bb');
   const dbg = document.getElementById('dbg');
   const availH = window.innerHeight - hud.offsetHeight - bb.offsetHeight - dbg.offsetHeight;
   const availW = window.innerWidth;
-  cv.width = availW; cv.height = availH;
+  // Backing store sized to the capped DPR; CSS keeps the on-screen size.
+  cv.width = Math.round(availW * DPR); cv.height = Math.round(availH * DPR);
   cv.style.width = availW + 'px'; cv.style.height = availH + 'px';
-  qc.width = qc.offsetWidth; qc.height = qc.offsetHeight;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // Offscreen layers match the game canvas backing store.
+  bgCanvas.width = cv.width; bgCanvas.height = cv.height;
+  bgCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  fgCanvas.width = cv.width; fgCanvas.height = cv.height;
+  fgCtx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  qc.width = Math.round(qc.offsetWidth * DPR); qc.height = Math.round(qc.offsetHeight * DPR);
+  qx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  _layout = null;        // invalidate cached layout
+  _bgDirty = true;       // static background needs redraw
+  _curtainGradL = _curtainGradR = null; // depend on layout width
   if (typeof hardReset === 'function') hardReset();
 }
+
+
 
 const GRAV = 0.38;
 const SCW  = 30;
 
+// Reference screen height the physics constants were originally tuned against.
+// We derive a per-resize scale factor (SCALE) from the actual playfield height so
+// that gravity / fall / knock / friction play out over the same NUMBER OF FRAMES
+// regardless of screen size. Without this, a fixed pixel gravity makes the arc
+// feel snappy on small screens and floaty on large ones.
+const REF_H = 720;
+let SCALE = 1;
+
+
+// Cache layout result; recomputed only on resize (see resize()).
+let _layout = null;
 function layout() {
-  const W = cv.width, H = cv.height;
+  if (_layout) return _layout;
+  // Use logical (CSS) pixels: ctx is scaled by DPR via setTransform, so all
+  // drawing happens in logical coordinates.
+  const W = cv.width / DPR, H = cv.height / DPR;
+
+  // Update the global physics scale factor whenever the layout (re)computes.
+  // The whole playfield scales linearly with H, so to keep the trajectory spanning
+  // the SAME NUMBER OF FRAMES regardless of screen size we scale per-frame gravity
+  // linearly with H as well: g = GRAV*(H/REF_H). Under v = sqrt(2*g*h) with
+  // h ∝ H, that gives launch velocity v ∝ H and time-to-peak t = v/g = const.
+  // (Launch velocity is also derived with this same gravity in vyFor(), so target
+  // heights stay accurate.) Horizontal pixel velocities scale by the same factor.
+  SCALE = H / REF_H;
+
+
   const RAMP_TOP = Math.round(H * 0.62);
+
   const GT  = Math.round(H * 0.55);
   const GM  = Math.round((GT + RAMP_TOP) / 2);
   const GP  = Math.round(GT - 20);
@@ -139,8 +210,12 @@ const RETURN_MS     = 3500;
 
 let cBalls = [], cFrame = 0, cSnatch = null;
 
+// Logical (CSS-pixel) chute dimensions. qx is DPR-scaled, so draw in logical space.
+function qLW() { return qc.width / DPR; }
+function qLH() { return qc.height / DPR; }
 function cLeft()  { return -CBR - 2; }
-function cRight() { return qc.width - CBR - 6; }
+function cRight() { return qLW() - CBR - 6; }
+
 
 function mkBall(entryFrame) {
   return { x: cLeft(), vx: 0, state: 'waiting', entryFrame, returnAt: 0 };
@@ -157,7 +232,8 @@ function chuteSpend() {
   let best = null, bx = -Infinity;
   cBalls.forEach(b => { if (b.state === 'resting' && b.x > bx) { bx = b.x; best = b; } });
   if (!best) return false;
-  cSnatch = { x: best.x, y: qc.height / 2, vx: 3, vy: 18, alpha: 1, trail: [] };
+  cSnatch = { x: best.x, y: qLH() / 2, vx: 3, vy: 18, alpha: 1, trail: [] };
+
   best.state = 'waiting';
   best.returnAt = timerDone ? Infinity : performance.now() + RETURN_MS;
   best.entryFrame = -1;
@@ -245,29 +321,42 @@ function upChute(now) {
   }
 }
 
-function drawChuteBall(x, y, r, alpha) {
-  if (x + r < 0 || x - r > qc.width) return;
-  qx.save(); qx.globalAlpha = Math.max(0, alpha);
-  const g = qx.createRadialGradient(x - r*.32, y - r*.32, r*.05, x, y, r);
+// Cached gradient for the chute ball, built once in a local space centered on the
+// ball; reused for every ball via translate so we don't rebuild it each frame.
+function chuteBallGrad() {
+  if (_chuteBallGrad) return _chuteBallGrad;
+  const r = CBR;
+  const g = qx.createRadialGradient(-r*.32, -r*.32, r*.05, 0, 0, r);
   g.addColorStop(0, '#E2AA72'); g.addColorStop(0.5, '#AC5E2A'); g.addColorStop(1, '#5C2E0E');
-  qx.beginPath(); qx.arc(x, y, r, 0, Math.PI*2);
-  qx.fillStyle = g; qx.fill();
+  _chuteBallGrad = g;
+  return g;
+}
+
+function drawChuteBall(x, y, r, alpha) {
+  if (x + r < 0 || x - r > qLW()) return;
+  qx.save(); qx.globalAlpha = Math.max(0, alpha);
+  qx.translate(x, y);
+  // Cached gradient is built for radius CBR; scale if a different radius is requested.
+  if (r !== CBR) qx.scale(r / CBR, r / CBR);
+  qx.beginPath(); qx.arc(0, 0, CBR, 0, Math.PI*2);
+  qx.fillStyle = chuteBallGrad(); qx.fill();
   qx.strokeStyle = '#2C1008'; qx.lineWidth = 1; qx.stroke();
-  qx.save(); qx.globalAlpha = alpha * 0.26;
-  qx.beginPath(); qx.arc(x - r*.28, y - r*.28, r*.3, 0, Math.PI*2);
-  qx.fillStyle = '#FFF'; qx.fill(); qx.restore();
+  qx.globalAlpha = alpha * 0.26;
+  qx.beginPath(); qx.arc(-CBR*.28, -CBR*.28, CBR*.3, 0, Math.PI*2);
+  qx.fillStyle = '#FFF'; qx.fill();
   qx.restore();
 }
 
 function drawChute() {
-  const CY = qc.height / 2;
-  qx.clearRect(0, 0, qc.width, qc.height);
+  const CW = qLW(), CH = qLH(), CY = CH / 2;
+  qx.clearRect(0, 0, CW, CH);
   // Trough
   const tg = qx.createLinearGradient(0, CY - CBR - 5, 0, CY + CBR + 5);
   tg.addColorStop(0, '#2A1608'); tg.addColorStop(0.4, '#0E0602'); tg.addColorStop(1, '#2A1608');
-  qx.fillStyle = tg; qx.beginPath(); qx.roundRect(0, CY - CBR - 5, qc.width, CBR*2 + 10, 3); qx.fill();
+  qx.fillStyle = tg; qx.beginPath(); qx.roundRect(0, CY - CBR - 5, CW, CBR*2 + 10, 3); qx.fill();
   qx.strokeStyle = 'rgba(160,100,35,0.4)'; qx.lineWidth = 1;
-  qx.beginPath(); qx.roundRect(0, CY - CBR - 5, qc.width, CBR*2 + 10, 3); qx.stroke();
+  qx.beginPath(); qx.roundRect(0, CY - CBR - 5, CW, CBR*2 + 10, 3); qx.stroke();
+
   // Balls
   cBalls.forEach(b => { if (b.state !== 'waiting') drawChuteBall(b.x, CY, CBR, 1); });
   // Snatch
@@ -352,7 +441,13 @@ function playTrigger(){tone(440,0.3,0.08,'square',880);setTimeout(()=>tone(880,0
 function playEmpty(){tone(180,0.12,0.06,'square');}
 
 // ── PHYSICS ───────────────────────────────────────────────────
-function vyFor(py,RT){const h=RT-py;return h<=0?-2.5:-Math.sqrt(2*GRAV*h);}
+// Effective per-frame gravity, scaled with screen height so the trajectory spans
+// the same number of frames on every screen size (see SCALE in layout()).
+function gravity(){return GRAV*SCALE;}
+// Launch velocity is derived with the SAME (scaled) gravity used during flight so
+// target heights stay accurate: with g and h both ∝ H, v=sqrt(2*g*h) ∝ H.
+function vyFor(py,RT){const h=RT-py;return h<=0?-2.5*SCALE:-Math.sqrt(2*gravity()*h);}
+
 function p2v(p,L){
   const vG=vyFor(L.GP,L.RAMP_TOP),v1=vyFor(L.SH[2].ty,L.RAMP_TOP),v2=vyFor(L.SH[1].ty,L.RAMP_TOP),v3=vyFor(L.SH[0].ty,L.RAMP_TOP),vO=vyFor(10,L.RAMP_TOP);
   if(p<0.30)return vG;
@@ -396,8 +491,11 @@ function startT(){
 
 function gP(e){
   const r=cv.getBoundingClientRect(),s=e.touches?e.touches[0]:e;
-  return{x:(s.clientX-r.left)*(cv.width/r.width),y:(s.clientY-r.top)*(cv.height/r.height),t:performance.now()};
+  // Map client coords to logical canvas coords. r.width/r.height are already in
+  // CSS (logical) pixels, matching the DPR-scaled drawing space.
+  return{x:(s.clientX-r.left)*((cv.width/DPR)/r.width),y:(s.clientY-r.top)*((cv.height/DPR)/r.height),t:performance.now()};
 }
+
 cv.addEventListener('mousedown',e=>{e.preventDefault();const p=gP(e);const L=layout();if(p.y>L.RAMP_TOP){fOn=true;fH=[p];}},{passive:false});
 cv.addEventListener('touchstart',e=>{e.preventDefault();const p=gP(e);const L=layout();if(p.y>L.RAMP_TOP){fOn=true;fH=[p];}},{passive:false});
 cv.addEventListener('mousemove',e=>{e.preventDefault();if(!fOn)return;const p=gP(e);fH.push(p);const n=performance.now();fH=fH.filter(h=>n-h.t<110);},{passive:false});
@@ -418,7 +516,8 @@ function launch(){
   const L=layout();
   playRoll(pw);
   balls.push({ph:'roll',rx:Math.max(L.FAR_L+10,Math.min(b.x,L.FAR_R-10)),pr:0,
-    rs:0.018+pw*0.075,rvx:(pvx/MAX)*9,pw,vy:p2v(pw,L),
+    rs:0.018+pw*0.075,rvx:(pvx/MAX)*9*SCALE,pw,vy:p2v(pw,L),
+
     wx:L.W/2,wy:L.RAMP_TOP,wvx:0,wvy:0,ang:0,alive:true,
     launchY:L.RAMP_TOP,minY:L.RAMP_TOP,peaked:false,sh:-1,land:L.GM,didLaunch:false});
   if(!going){going=true;startT();}
@@ -444,7 +543,8 @@ function checkHit(ball,L){
       floats.push({x:t.x,y:s.ty,pts:t.pts,life:1});
       playKnock(t.pts);setTimeout(()=>playScore(t.pts),70);
       if(t.type==='trigger')fireTrigger();
-      ball.wvx*=0.08;ball.wvy=4.5;ball.land=s.sy;ball.ph='fall';return;
+      ball.wvx*=0.08;ball.wvy=4.5*SCALE;ball.land=s.sy;ball.ph='fall';return;
+
     }
   }
 }
@@ -467,7 +567,8 @@ function upBalls(){
           if(!b.didLaunch){b.didLaunch=true;playLaunch();}
         }
       } else if(b.ph==='rise'){
-        b.wvy+=GRAV;b.wx+=b.wvx;b.wy+=b.wvy;b.ang+=b.wvx*0.04;b.wvx*=0.994;
+        b.wvy+=gravity();b.wx+=b.wvx;b.wy+=b.wvy;b.ang+=b.wvx*0.04;b.wvx*=0.994;
+
         if(b.wy<b.minY)b.minY=b.wy;
         if(b.wx<L.WL){b.wx=L.WL;b.wvx=Math.abs(b.wvx)*0.88;playWall();}
         if(b.wx>L.WR){b.wx=L.WR;b.wvx=-Math.abs(b.wvx)*0.88;playWall();}
@@ -478,7 +579,8 @@ function upBalls(){
         if(b.peaked&&b.wy>ft)b.ph='fall';
         if(b.wy<-30){b.wvy=0.5;b.ph='fall';}
       } else {
-        b.wvy+=0.88;b.wx+=b.wvx*0.06;b.wy+=b.wvy;
+        b.wvy+=0.88*SCALE;b.wx+=b.wvx*0.06;b.wy+=b.wvy;
+
         if(b.wy>=b.land){if(b.sh>=0)playLand(b.sh);else playGutter();b.alive=false;}
         if(b.wy>L.RAMP_TOP+30)b.alive=false;
       }
@@ -497,27 +599,27 @@ function upF(){
 }
 
 // ── DRAW ──────────────────────────────────────────────────────
-function dWall(L){
+function dWall(g2d,L){
   const{W,H,GT,GM,RAMP_TOP,SH}=L;
-  ctx.fillStyle='#0C0602';ctx.fillRect(0,0,W,RAMP_TOP);
-  for(let i=0;i<7;i++){ctx.fillStyle=i%2===0?'#120804':'#0A0502';ctx.fillRect(i*(W/7),0,W/7,RAMP_TOP);}
+  g2d.fillStyle='#0C0602';g2d.fillRect(0,0,W,RAMP_TOP);
+  for(let i=0;i<7;i++){g2d.fillStyle=i%2===0?'#120804':'#0A0502';g2d.fillRect(i*(W/7),0,W/7,RAMP_TOP);}
   SH.forEach((s,ri)=>{
-    let g=ctx.createLinearGradient(0,s.sy,0,s.sy+14);g.addColorStop(0,'#3E2412');g.addColorStop(1,'#281608');
-    ctx.fillStyle=g;ctx.fillRect(0,s.sy,W,14);
-    ctx.fillStyle='rgba(210,150,55,0.3)';ctx.fillRect(0,s.sy,W,1.5);
-    if(ri<2){g=ctx.createLinearGradient(0,s.ry,0,s.ry+s.rh);g.addColorStop(0,'#1C0E06');g.addColorStop(1,'#120A04');ctx.fillStyle=g;ctx.fillRect(0,s.ry,W,s.rh);}
-    ctx.fillStyle=s.col;ctx.globalAlpha=0.09;ctx.fillRect(0,s.sy,W,14);ctx.globalAlpha=1;
-    ctx.fillStyle=s.col;ctx.font='bold 9px Georgia';ctx.textAlign='left';
-    ctx.fillText(s.pts+' pts',SCW+4,s.ty-CRH*s.sc*0.5-5);
+    let g=g2d.createLinearGradient(0,s.sy,0,s.sy+14);g.addColorStop(0,'#3E2412');g.addColorStop(1,'#281608');
+    g2d.fillStyle=g;g2d.fillRect(0,s.sy,W,14);
+    g2d.fillStyle='rgba(210,150,55,0.3)';g2d.fillRect(0,s.sy,W,1.5);
+    if(ri<2){g=g2d.createLinearGradient(0,s.ry,0,s.ry+s.rh);g.addColorStop(0,'#1C0E06');g.addColorStop(1,'#120A04');g2d.fillStyle=g;g2d.fillRect(0,s.ry,W,s.rh);}
+    g2d.fillStyle=s.col;g2d.globalAlpha=0.09;g2d.fillRect(0,s.sy,W,14);g2d.globalAlpha=1;
+    g2d.fillStyle=s.col;g2d.font='bold 9px Georgia';g2d.textAlign='left';
+    g2d.fillText(s.pts+' pts',SCW+4,s.ty-CRH*s.sc*0.5-5);
   });
-  ctx.fillStyle='#0A0806';ctx.fillRect(0,GT,W,RAMP_TOP-GT);
-  ctx.fillStyle='rgba(90,50,15,0.3)';ctx.fillRect(0,GT,W,1.5);
-  ctx.fillStyle='rgba(120,70,20,0.4)';ctx.font='italic 8px Georgia';ctx.textAlign='center';
-  ctx.fillText('-- gutter --',W/2,GM+3);
+  g2d.fillStyle='#0A0806';g2d.fillRect(0,GT,W,RAMP_TOP-GT);
+  g2d.fillStyle='rgba(90,50,15,0.3)';g2d.fillRect(0,GT,W,1.5);
+  g2d.fillStyle='rgba(120,70,20,0.4)';g2d.font='italic 8px Georgia';g2d.textAlign='center';
+  g2d.fillText('-- gutter --',W/2,GM+3);
   // timer bar drawn in HUD
-  const lp=ctx.createLinearGradient(0,RAMP_TOP-5,0,RAMP_TOP+4);
+  const lp=g2d.createLinearGradient(0,RAMP_TOP-5,0,RAMP_TOP+4);
   lp.addColorStop(0,'#C08030');lp.addColorStop(0.5,'#7A4C18');lp.addColorStop(1,'#2A1006');
-  ctx.fillStyle=lp;ctx.fillRect(0,RAMP_TOP-5,W,8);
+  g2d.fillStyle=lp;g2d.fillRect(0,RAMP_TOP-5,W,8);
 }
 
 function dTarget(t,L){
@@ -546,9 +648,12 @@ function dTarget(t,L){
   ctx.restore();
 }
 
-function dRamp(L){
+function dRamp(g2d,L){
+  const ctx=g2d; // render into the supplied context (offscreen fg layer)
   const{W,H,RAMP_TOP,FAR_L,FAR_R,LIP_BOT,WTN}=L;
+  ctx.clearRect(0,0,W,H);
   ctx.fillStyle='#0E0804';ctx.fillRect(0,RAMP_TOP,W,H-RAMP_TOP);
+
   const fg=ctx.createLinearGradient(0,H,0,RAMP_TOP);
   fg.addColorStop(0,'rgb(148,104,44)');fg.addColorStop(1,'rgb(188,136,68)');
   ctx.beginPath();ctx.moveTo(0,H);ctx.lineTo(W,H);ctx.lineTo(FAR_R,RAMP_TOP);ctx.lineTo(FAR_L,RAMP_TOP);ctx.closePath();
@@ -582,25 +687,53 @@ function dRamp(L){
   ctx.beginPath();ctx.moveTo(W,WTN);ctx.lineTo(FAR_R,RAMP_TOP);ctx.stroke();
 }
 
+// Render the static wall (background) and ramp/side-walls (foreground) once into
+// their offscreen layers. Re-run only when _bgDirty (set on resize). This removes
+// ~13 gradient builds + dozens of path fills from every animation frame.
+function renderStaticLayers(L){
+  if(!_bgDirty)return;
+  bgCtx.clearRect(0,0,L.W,L.H);
+  dWall(bgCtx,L);
+  dRamp(fgCtx,L);   // dRamp clears fgCtx itself
+  _bgDirty=false;
+}
+
+// Cached radial gradient for the flying ball (radius 16, centered at 0,0).
+// Reused for every ball via translate so it isn't rebuilt each frame.
+const BALL_R=16;
+function ballGrad(){
+  if(_ballGrad)return _ballGrad;
+  const r=BALL_R;
+  const g=ctx.createRadialGradient(-r*.32,-r*.32,r*.05,0,0,r);
+  g.addColorStop(0,'#E2AA72');g.addColorStop(.5,'#AC5E2A');g.addColorStop(1,'#5C2E0E');
+  _ballGrad=g;
+  return g;
+}
+
 function dBall(b,L){
   let sx,sy,r;
   if(b.ph==='roll'){const p=bRP(b.rx,b.pr,L);sx=p.x;sy=p.y;r=p.r;}
-  else{r=16;sx=b.wx;sy=b.wy;}
+  else{r=BALL_R;sx=b.wx;sy=b.wy;}
   ctx.save();ctx.translate(sx,sy);ctx.rotate(b.ang);
-  ctx.beginPath();ctx.arc(0,0,r,0,Math.PI*2);
-  const g=ctx.createRadialGradient(-r*.32,-r*.32,r*.05,0,0,r);
-  g.addColorStop(0,'#E2AA72');g.addColorStop(.5,'#AC5E2A');g.addColorStop(1,'#5C2E0E');
-  ctx.fillStyle=g;ctx.fill();ctx.strokeStyle='#2C1008';ctx.lineWidth=1;ctx.stroke();
+  // Cached gradient is built for radius BALL_R; scale for the smaller rolling ball.
+  if(r!==BALL_R)ctx.scale(r/BALL_R,r/BALL_R);
+  ctx.beginPath();ctx.arc(0,0,BALL_R,0,Math.PI*2);
+  ctx.fillStyle=ballGrad();ctx.fill();ctx.strokeStyle='#2C1008';ctx.lineWidth=1;ctx.stroke();
   ctx.restore();
 }
 
 function dCurtains(L){
   const{W,RAMP_TOP}=L;
-  let lc=ctx.createLinearGradient(0,0,SCW+8,0);lc.addColorStop(0,'#0A0502');lc.addColorStop(0.75,'#160A03');lc.addColorStop(1,'rgba(16,8,2,0)');
-  ctx.fillStyle=lc;ctx.fillRect(0,0,SCW+10,RAMP_TOP);
-  let rc=ctx.createLinearGradient(W-SCW-8,0,W,0);rc.addColorStop(0,'rgba(16,8,2,0)');rc.addColorStop(0.25,'#160A03');rc.addColorStop(1,'#0A0502');
-  ctx.fillStyle=rc;ctx.fillRect(W-SCW-10,0,SCW+10,RAMP_TOP);
+  if(!_curtainGradL){
+    _curtainGradL=ctx.createLinearGradient(0,0,SCW+8,0);
+    _curtainGradL.addColorStop(0,'#0A0502');_curtainGradL.addColorStop(0.75,'#160A03');_curtainGradL.addColorStop(1,'rgba(16,8,2,0)');
+    _curtainGradR=ctx.createLinearGradient(W-SCW-8,0,W,0);
+    _curtainGradR.addColorStop(0,'rgba(16,8,2,0)');_curtainGradR.addColorStop(0.25,'#160A03');_curtainGradR.addColorStop(1,'#0A0502');
+  }
+  ctx.fillStyle=_curtainGradL;ctx.fillRect(0,0,SCW+10,RAMP_TOP);
+  ctx.fillStyle=_curtainGradR;ctx.fillRect(W-SCW-10,0,SCW+10,RAMP_TOP);
 }
+
 
 function dFloats(L){
   const{W,RAMP_TOP}=L;
@@ -609,21 +742,45 @@ function dFloats(L){
   if(chuteReadyN()===0&&!over){ctx.save();ctx.globalAlpha=0.5+Math.sin(performance.now()*0.008)*0.4;ctx.fillStyle='#E05030';ctx.font='bold 12px Georgia';ctx.textAlign='center';ctx.fillText('wait...',W/2,RAMP_TOP-18);ctx.restore();}
 }
 
+// Lightweight FPS counter shown in the #dbg line (averaged over a few frames).
+let _fpsAccum=0,_fpsFrames=0,_fpsLast=performance.now(),_fpsText='';
+function updateFps(now,dt){
+  _fpsAccum+=dt;_fpsFrames++;
+  if(now-_fpsLast>=500){
+    const fps=Math.round(1000/(_fpsAccum/_fpsFrames));
+    _fpsText=fps+' fps';
+    _fpsAccum=0;_fpsFrames=0;_fpsLast=now;
+    const dbg=document.getElementById('dbg');
+    if(dbg){
+      // Append the fps reading without clobbering the existing status text.
+      const base=dbg.textContent.replace(/\s*\|\s*\d+ fps$/,'');
+      dbg.textContent=base+' | '+_fpsText;
+    }
+  }
+}
+
 function loop(){
   fid=requestAnimationFrame(loop);
   const now=performance.now(),dt=now-lastT;lastT=now;
   const L=layout();
+  // (Re)build static layers only when needed (resize), then blit them each frame.
+  renderStaticLayers(L);
   ctx.clearRect(0,0,L.W,L.H);
-  dWall(L);
+  // Background wall layer — drawing the DPR-resolution offscreen canvas at logical
+  // size lets the DPR-scaled ctx map it 1:1.
+  ctx.drawImage(bgCanvas,0,0,L.W,L.H);
   for(let ri=0;ri<L.SH.length;ri++)targets.filter(t=>t.ri===ri&&t.alive).forEach(t=>dTarget(t,L));
-  dRamp(L);
+  // Foreground ramp/side-walls layer (drawn in front of the targets).
+  ctx.drawImage(fgCanvas,0,0,L.W,L.H);
   balls.forEach(b=>dBall(b,L));
   dFloats(L);
   dCurtains(L);
   if(!over||timerDone){upTargets(dt,now);upBalls();upF();upChute(now);}
   drawChute();
   drawTimerBar();
+  updateFps(now,dt);
 }
+
 
 window.addEventListener('resize',resize);
 resize();
